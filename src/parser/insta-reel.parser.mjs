@@ -1,102 +1,87 @@
 import puppeteer from "puppeteer";
-import * as cheerio from "cheerio";
 import removeQueryFromUrl from "../utils/remove-query-from-url.mjs";
 import ReelCache from "../schema/reel-cache.schema.mjs";
 
-async function getHTML(url) {
-  // Launch a headless browser instance
-  const browser = await puppeteer.launch({
-    headless: "new",
-    args: ["--no-sandbox"],
-  });
-
-  // Create a new page
-  const page = await browser.newPage();
-
-  // Navigate to a URL
-  await page.goto(url);
-
-  // Wait for the video tag to appear
-  await page.waitForSelector("video");
-
-  // Get the HTML content
-  const html = await page.content();
-
-  // Close the browser
-  await page.close();
-  await browser.close();
-
-  // Return the HTML content
-  return html;
-}
-
-export async function getReelVideo(url) {
-  const html = await getHTML(url);
-
-  // calls cheerio to process the html received
-  const $ = cheerio.load(html);
-
-  // Searches the html for the video tag and get the src atttribute
-  const videoDirectLink = $("video").attr("src");
-
-  // returns the direct video link
-  return videoDirectLink;
-}
-
-// Resolves the actual video bytes for a reel, including the case where the
-// <video> src is a `blob:` URL. Blob URLs only exist inside the browser tab
-// that created them, so they can't be fetched from Node directly — we have
-// to resolve them from inside the page context first.
-export async function getReelVideoBuffer(url) {
+// Instagram plays reels through MediaSource Extensions, so `video.src` is a
+// `blob:` URL wrapping a MediaSource object — NOT a real Blob. `fetch()` on
+// that URL always fails ("Failed to fetch"), from inside the page or out,
+// because fetch only works on blob URLs created from an actual Blob/File.
+//
+// Instead, we sniff the real network response for the underlying .mp4 file
+// that the player requests from Instagram's CDN, which is a normal,
+// directly-fetchable, signed URL.
+async function resolveReelVideoUrl(url) {
   const browser = await puppeteer.launch({
     headless: "new",
     args: ["--no-sandbox"],
   });
   const page = await browser.newPage();
+
+  let videoUrl;
+
+  page.on("response", (response) => {
+    if (videoUrl) return;
+    try {
+      const req = response.request();
+      const respUrl = response.url();
+      const contentType = response.headers()["content-type"] || "";
+      const looksLikeVideo =
+        req.resourceType() === "media" || contentType.startsWith("video/");
+      if (looksLikeVideo && /\.mp4(\?|$)/.test(respUrl)) {
+        videoUrl = respUrl;
+      }
+    } catch {
+      // ignore malformed/aborted responses
+    }
+  });
 
   try {
-    await page.goto(url);
+    await page.goto(url, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("video");
 
-    const videoSrc = await page.$eval("video", (el) => el.src);
+    // Nudge playback so the player actually issues the media request.
+    await page
+      .evaluate(() => {
+        const v = document.querySelector("video");
+        if (v) {
+          v.muted = true;
+          v.play().catch(() => {});
+        }
+      })
+      .catch(() => {});
 
-    let buffer;
-    let contentType = "video/mp4";
-
-    if (videoSrc.startsWith("blob:")) {
-      // Fetch the blob and read it back out as a base64 data URL from
-      // inside the page, then hand the base64 string back to Node.
-      const dataUrl = await page.evaluate(async (blobUrl) => {
-        const blob = await fetch(blobUrl).then((r) => r.blob());
-        return await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-      }, videoSrc);
-
-      const match = dataUrl.match(/^data:(.+);base64,(.*)$/);
-      if (!match) {
-        throw new Error("Failed to resolve blob video data");
-      }
-      contentType = match[1] || contentType;
-      buffer = Buffer.from(match[2], "base64");
-    } else {
-      // Direct URL, can be fetched straight from Node.
-      const response = await fetch(videoSrc);
-      if (!response.ok) {
-        throw new Error(`Failed to download video: ${response.status}`);
-      }
-      contentType = response.headers.get("content-type") || contentType;
-      buffer = Buffer.from(await response.arrayBuffer());
+    const deadline = Date.now() + 15000;
+    while (!videoUrl && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
     }
 
-    return { buffer, contentType };
+    if (!videoUrl) {
+      throw new Error("Could not locate direct video URL from network traffic");
+    }
+
+    return videoUrl;
   } finally {
     await page.close();
     await browser.close();
   }
+}
+
+export async function getReelVideo(url) {
+  return await resolveReelVideoUrl(url);
+}
+
+// Resolves and downloads the actual video bytes for a reel.
+export async function getReelVideoBuffer(url) {
+  const videoUrl = await resolveReelVideoUrl(url);
+
+  const response = await fetch(videoUrl);
+  if (!response.ok) {
+    throw new Error(`Failed to download video: ${response.status}`);
+  }
+  const contentType = response.headers.get("content-type") || "video/mp4";
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  return { buffer, contentType, videoUrl };
 }
 
 export async function cacheReelInfo(url) {
