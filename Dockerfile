@@ -13,7 +13,7 @@ COPY pnpm-workspace.yaml .
 RUN npm install -g pnpm
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
-RUN pnpm ci
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
