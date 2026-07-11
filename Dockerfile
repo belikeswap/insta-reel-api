@@ -7,12 +7,17 @@ WORKDIR /app
 
 COPY package-lock.json .
 COPY package.json .
+COPY pnpm-lock.yaml .
+COPY pnpm-workspace.yaml .
 
-RUN npm ci
+RUN npm install -g pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+RUN pnpm ci
 
 COPY . .
 
 EXPOSE 8080
 
-CMD ["npm", "run", "start"]
+CMD ["pnpm", "start"]
 
